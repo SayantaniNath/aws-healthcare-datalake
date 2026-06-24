@@ -1,0 +1,8 @@
+# Data files — never commit PHI or large CSVs
+*.csv
+*.parquet
+output/
+*.DS_Store
+*.env
+secrets/
+profile.yaml
