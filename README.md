@@ -177,15 +177,125 @@ python3 validation/ge_validate_silver_patients.py
 
 ---
 
-## Key Debugging Lessons
+## Debugging Log — All Errors and Fixes
 
-**Issue: DQDL ColumnCount = 15 failing with 16**
-Cause: Glue Crawler auto-detected a `partition_0` column that doesn't exist in the parquet files.
-Fix: Deleted the crawler-created table, recreated via CLI with `"PartitionKeys": []`.
-Lesson: DQDL evaluates Glue Catalog schema, not S3 files. Always verify at the actual data layer first.
+### Glue ETL Job Errors
+
+---
+
+**Error: `s3:DeleteObject` not authorized on `write.mode("overwrite")`**
+
+```
+AccessDeniedException: User: arn:aws:iam::941141114246:role/AWSGlueServiceRole-clinicalflow
+is not authorized to perform: s3:DeleteObject
+```
+
+Cause: `mode("overwrite")` deletes existing files in the S3 prefix before writing new ones. The Glue IAM role only had `s3:PutObject` and `s3:GetObject`.
+
+Fix: Added `s3:DeleteObject` to the `AWSGlueServiceRole-clinicalflow` inline policy for the bucket.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+  "Resource": [
+    "arn:aws:s3:::clinicalflow-datalake-941141114246",
+    "arn:aws:s3:::clinicalflow-datalake-941141114246/*"
+  ]
+}
+```
+
+---
+
+**Error: Union struct types on numeric columns**
+
+```
+AnalysisException: Resolved attribute missing from child: healthcare_expenses#xx
+(or struct type {'double': 41009.33, 'string': None} in silver output)
+```
+
+Cause: 3 malformed rows in `patients.csv` (lines 60385, 60401, 64324) had two records concatenated on one line. Glue saw some rows with numeric values and some with string spill — inferred column type as a union struct `{double, string}`.
+
+Fix: Added `resolveChoice` on the DynamicFrame before `.toDF()` to force concrete types:
+
+```python
+.resolveChoice(specs=[
+    ("zip",                 "cast:string"),
+    ("healthcare_expenses", "cast:double"),
+    ("healthcare_coverage", "cast:double"),
+    ("income",              "cast:long"),
+    ("fips",                "cast:long")
+])
+```
+
+---
+
+**Error: PHI columns `address`, `drivers`, `maiden` present in silver layer**
+
+Cause: Initial drop list covered only the most obvious Safe Harbor fields. `maiden` (pre-marriage last name, 16K rows), `drivers` (license number e.g. S99956685, 52K/64K rows), and `address` (full street address) were missed.
+
+Fix: Audited all 28 raw columns against Safe Harbor § 164.514(b)(2) — added all three to `cols_to_drop`.
+
+---
+
+**Error: Duplicate `job.commit()` — job failed or behaved unexpectedly**
+
+Cause: Glue console auto-inserts a `job.commit()` at the top as boilerplate when creating a job. User also added one at the end, resulting in two calls. Calling `job.commit()` mid-script before the write completed caused issues.
+
+Fix: Keep only the final `job.commit()` after the write step. Delete any auto-inserted one from the top.
+
+---
+
+**Error: Python syntax error — comments inside method chains**
+
+```
+SyntaxError: invalid syntax
+```
+
+Cause: Inline `# comments` were placed inside a chained method call using line continuation `\`:
+
+```python
+# WRONG — comment breaks the chain
+quarantine_df \
+    .withColumn('reason', F.lit('malformed')) \  # this breaks it
+    .write.parquet(...)
+```
+
+Fix: Move comments above the chain block, never inline within `\`-continued expressions.
+
+---
+
+### DQDL / Data Quality Errors
+
+---
+
+**Error: DQDL `ColumnCount = 15` failing with count 16**
+
+```
+DQDL rule FAILED: ColumnCount = 15 (actual: 16)
+```
+
+Cause: Glue Crawler added a spurious `partition_0` partition key to the `clinicalflow_silver.patients` catalog table. This column existed in the catalog metadata but not in the actual parquet files.
+
+First fix attempt: Added exclusion patterns in the crawler — did not remove the already-created partition key from the existing table.
+
+Second fix attempt: `aws glue update-table` — failed:
+
+```
+InvalidInputException: PartitionColumns cannot be deleted when indexes are enabled
+```
+
+Final fix: Delete the table and recreate it via CLI with `"PartitionKeys": []`:
 
 ```bash
-# Ground truth check — bypasses catalog entirely
+aws glue delete-table --database-name clinicalflow_silver --name patients
+aws glue create-table --database-name clinicalflow_silver --table-input file://table_def.json
+# table_def.json must have "PartitionKeys": []
+```
+
+Lesson: DQDL evaluates the Glue Catalog schema, not S3 files directly. Stale or incorrect catalog metadata = wrong DQDL results. When catalog and data disagree, ground truth is S3:
+
+```bash
 python3 -c "
 import pandas as pd
 df = pd.read_parquet('s3://clinicalflow-datalake-941141114246/silver/patients/',
@@ -194,13 +304,112 @@ print(len(df.columns), 'columns:', df.columns.tolist())
 "
 ```
 
-**Issue: Union struct types in silver output**
-Cause: 3 malformed rows in raw CSV caused Glue to infer columns like `healthcare_expenses` as either double or string → struct type `{'double': 41009.33, 'string': None}`.
-Fix: `resolveChoice(specs=[("healthcare_expenses", "cast:double"), ...])` on the DynamicFrame before `.toDF()`.
+---
 
-**Issue: PHI columns address/drivers/maiden survived de-id**
-Cause: Original drop list only covered the most obvious Safe Harbor fields.
-Fix: Audited all 28 raw columns against Safe Harbor § 164.514(b)(2) — added 3 missed identifiers.
+**Error: DQDL Spark exception on column statistics**
+
+```
+AnalysisException: Resolved attribute missing from child: partition_0
+```
+
+Cause: Follow-on from the `partition_0` issue above. DQDL's statistics engine tried to compute column-level stats, Spark attempted to read `partition_0` from S3 parquet files — it doesn't exist there, causing a Spark analysis failure.
+
+Fix: Same as above — recreate table without partition keys.
+
+---
+
+### GE Validation Script Errors
+
+---
+
+**Error: `ArrowInvalid: GetFileInfo() yielded path outside base dir`**
+
+Cause: `pyarrow.parquet.ParquetDataset` with an `s3fs` filesystem normalises paths internally, producing a path that doesn't match the base dir prefix.
+
+```python
+# Broken
+import s3fs, pyarrow.parquet as pq
+fs = s3fs.S3FileSystem()
+df = pq.ParquetDataset(SILVER_PATH, filesystem=fs).read_pandas().to_pandas()
+```
+
+Fix: Replace with `pandas.read_parquet` using `storage_options`:
+
+```python
+df = pd.read_parquet(SILVER_PATH, storage_options={"anon": False})
+# anon: False → use AWS credentials from ~/.aws/credentials instead of anonymous access
+```
+
+---
+
+**Error: `AttributeError: 'PandasDataset' object has no attribute 'expect_column_to_not_exist'`**
+
+Cause: GE 0.18 removed `expect_column_to_not_exist` from the built-in expectation set.
+
+Fix: Manual Python check inline, stored in the same results list format:
+
+```python
+absent = col not in set(df.columns)
+results.append({"check": f"column '{col}' absent", "success": absent, "detail": {}})
+```
+
+---
+
+### Iceberg Catalog Errors (Glue Job)
+
+---
+
+**Error 1: `REQUIRES_SINGLE_PART_NAMESPACE`**
+
+```
+AnalysisException: [REQUIRES_SINGLE_PART_NAMESPACE] spark_catalog requires a single-part
+namespace, but got `glue_catalog`.`clinicalflow_silver`.
+```
+
+Cause: `glue_catalog` was not registered as a catalog — Spark fell back to the default `spark_catalog` and tried to interpret `glue_catalog.clinicalflow_silver` as a two-part namespace under it.
+
+Root cause: Multiple `--conf` job parameters in the Glue console are stored as a JSON dict — duplicate keys mean only the last one survives. Setting `--conf` four times (once per catalog property) meant only the final value was applied, and none of the catalog settings were actually loaded.
+
+Fix: Chain all `--conf` values into a single key's value, space-separated:
+
+```
+Key:   --conf
+Value: spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+       --conf spark.sql.catalog.glue_catalog=...
+       --conf spark.sql.catalog.glue_catalog.warehouse=...
+       --conf spark.sql.catalog.glue_catalog.io-impl=...
+```
+
+Also: `spark.conf.set()` calls in the script for catalog config are ineffective — they run after `SparkContext` initialises, which is too late for catalog plugin registration. All catalog config must be in job parameters.
+
+---
+
+**Error 2: `Plugin class for catalog 'glue_catalog' does not implement CatalogPlugin: org.apache.iceberg.aws.glue.GlueCatalog`**
+
+```
+An error occurred while calling createOrReplace.
+Plugin class for catalog 'glue_catalog' does not implement CatalogPlugin:
+org.apache.iceberg.aws.glue.GlueCatalog
+```
+
+Cause: `org.apache.iceberg.aws.glue.GlueCatalog` is an Iceberg catalog implementation (storage backend), not a Spark `CatalogPlugin`. It does not implement the interface Spark requires for catalog registration. The correct Spark-facing plugin class is `org.apache.iceberg.spark.SparkCatalog`, which wraps `GlueCatalog`.
+
+Fix: Use `SparkCatalog` as the catalog plugin and reference `GlueCatalog` as the `catalog-impl`:
+
+```
+spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+spark.sql.catalog.glue_catalog.warehouse=s3://clinicalflow-datalake-941141114246/
+spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+```
+
+Full working `--conf` value (single key, all chained):
+
+```
+spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.warehouse=s3://clinicalflow-datalake-941141114246/ --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+```
+
+Think of it as two layers: `SparkCatalog` is the Spark-facing plugin; `GlueCatalog` is the AWS-facing storage backend underneath it.
 
 ---
 

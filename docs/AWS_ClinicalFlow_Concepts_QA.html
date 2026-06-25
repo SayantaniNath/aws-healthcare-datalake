@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AWS ClinicalFlow — Concepts & Q&A Reference</title>
+<style>
+  :root {
+    --accent: #0969da;
+    --bg: #ffffff;
+    --surface: #f6f8fa;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --muted: #656d76;
+    --success: #1a7f37;
+    --warning: #9a6700;
+    --danger: #cf222e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; color: var(--text); background: var(--bg); line-height: 1.6; max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+  h1 { font-size: 26px; font-weight: 700; border-bottom: 2px solid var(--accent); padding-bottom: 12px; margin-bottom: 8px; }
+  h2 { font-size: 20px; font-weight: 700; color: var(--accent); margin: 36px 0 12px; border-left: 4px solid var(--accent); padding-left: 12px; }
+  h3 { font-size: 16px; font-weight: 600; margin: 24px 0 8px; color: var(--text); }
+  p { margin: 8px 0; }
+  code { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; }
+  pre { background: #0d1117; color: #e6edf3; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 12px 0; font-size: 13px; line-height: 1.5; }
+  pre code { background: none; border: none; padding: 0; color: inherit; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th { background: var(--surface); border: 1px solid var(--border); padding: 8px 12px; text-align: left; font-weight: 600; }
+  td { border: 1px solid var(--border); padding: 8px 12px; }
+  tr:nth-child(even) td { background: var(--surface); }
+  .qa-block { border: 1px solid var(--border); border-radius: 8px; margin: 16px 0; overflow: hidden; }
+  .qa-q { background: var(--surface); padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--border); }
+  .qa-q::before { content: "Q: "; color: var(--accent); }
+  .qa-a { padding: 12px 16px; }
+  .qa-a::before { content: "A: "; font-weight: 600; color: var(--success); }
+  .tag { display: inline-block; background: var(--accent); color: white; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 12px; margin-bottom: 8px; }
+  .note { background: #fff8c5; border-left: 4px solid #d4a72c; padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0; font-size: 14px; }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 32px; }
+  @media print { body { padding: 16px; } h2 { page-break-before: always; } }
+</style>
+</head>
+<body>
+
+<h1>AWS ClinicalFlow — Concepts & Q&A Reference</h1>
+<p class="meta">Built during ClinicalFlow Phase 1 sessions · Last updated 2026-06-25 · ~/Downloads/AWS_Hands_On/</p>
+
+<!-- ─────────────────────────────────────────────── -->
+<h2>1. CSV vs Parquet</h2>
+
+<div class="qa-block">
+  <div class="qa-q">Why do we use Parquet instead of CSV for the silver layer?</div>
+  <div class="qa-a">Parquet is columnar — it stores data column by column instead of row by row. This means analytical queries only read the columns they need. CSV reads everything even if you only need 2 of 15 columns.</div>
+</div>
+
+<h3>How CSV stores data</h3>
+<p>Row-based, plain text, no schema embedded:</p>
+<pre><code>id,gender,zip,birth_year_bucket,healthcare_expenses
+9af9a253,M,021,1970,41009.33
+b3c1d2e4,F,024,1965,28500.00
+a1b2c3d4,M,017,1980,15200.75</code></pre>
+<p>To find all <code>healthcare_expenses</code> — must read the entire file line by line, including every column you don't need.</p>
+
+<h3>How Parquet stores data</h3>
+<p>Column-by-column, compressed, schema embedded in the file:</p>
+<pre><code>┌─────────────────────────────────────────┐
+│ Row Group (chunk of rows)               │
+│                                         │
+│  id column:                             │
+│  [9af9a253, b3c1d2e4, a1b2c3d4]        │
+│                                         │
+│  gender column:                         │
+│  dictionary encoded → M=0, F=1         │
+│  stored as [0, 1, 0]                   │
+│                                         │
+│  birth_year_bucket column:              │
+│  delta encoded → [1970, -5, +15]       │
+│                                         │
+│  healthcare_expenses column:            │
+│  [41009.33, 28500.00, 15200.75]        │
+└─────────────────────────────────────────┘</code></pre>
+
+<p>Query <code>SELECT birth_year_bucket, healthcare_expenses FROM patients</code>:</p>
+<ul style="margin: 8px 0 8px 24px;">
+  <li><strong>CSV</strong> — reads all 15 columns for every row, throws away 13</li>
+  <li><strong>Parquet</strong> — skips directly to the 2 columns needed, ignores the rest</li>
+</ul>
+
+<h3>Comparison table</h3>
+<table>
+  <tr><th></th><th>CSV</th><th>Parquet</th></tr>
+  <tr><td>Format</td><td>Row-based, plain text</td><td>Columnar, binary</td></tr>
+  <tr><td>Size</td><td>Large — no compression</td><td>Small — Snappy compressed (~5× smaller)</td></tr>
+  <tr><td>Schema</td><td>None — inferred at read time</td><td>Embedded in file — types guaranteed</td></tr>
+  <tr><td>Query speed</td><td>Must read every column</td><td>Reads only queried columns</td></tr>
+  <tr><td>Null handling</td><td>Empty string or "null" text</td><td>Efficient native encoding</td></tr>
+  <tr><td>Data lake standard</td><td>❌</td><td>✅ Iceberg, Delta, Athena, Redshift Spectrum</td></tr>
+</table>
+
+<div class="note">
+  <strong>Real numbers:</strong> Your 64K patients × 15 columns — CSV ~8 MB (reads all 8 MB per query), Parquet ~3.7 MB (a 2-column query reads ~0.5 MB). At billions of rows the gap becomes enormous — Athena charges per byte scanned.
+</div>
+
+<h3>What .snappy means in the filename</h3>
+<pre><code>part-00000-8a458cba-9ca3-46f0-94e9-b2e122989bb3-c000.snappy.parquet
+│           │                                         │      │
+│           UUID (unique file ID)                     │      └── file format: parquet
+│                                                     └───────── compression: snappy
+└─────────────────────────────────────────────────────────────── partition number</code></pre>
+<p><strong>Snappy</strong> = compression codec. Fast decompression, good ratio, Spark's default. You see this in the S3 console filename — <code>aws s3 ls s3://clinicalflow-datalake-941141114246/silver/patients/</code></p>
+
+<!-- ─────────────────────────────────────────────── -->
+<h2>2. Parquet vs Iceberg</h2>
+
+<div class="qa-block">
+  <div class="qa-q">We already have Parquet in silver. Why switch to Iceberg?</div>
+  <div class="qa-a">Plain Parquet gives you files. Iceberg gives you a table. The data is still Parquet underneath — Iceberg adds a metadata layer that enables time travel, ACID transactions, row-level deletes, and schema evolution.</div>
+</div>
+
+<h3>What Iceberg adds on top of Parquet</h3>
+<pre><code>silver/patients/
+├── data/
+│   └── part-00000-....snappy.parquet   ← same parquet file as before
+└── metadata/
+    ├── v1.metadata.json                ← snapshot history
+    ├── snap-....avro                   ← manifest (which files belong to which snapshot)
+    └── version-hint.text               ← current version pointer</code></pre>
+
+<h3>Feature comparison</h3>
+<table>
+  <tr><th>Feature</th><th>Plain Parquet</th><th>Iceberg</th></tr>
+  <tr><td>Time travel</td><td>❌</td><td>✅ <code>SELECT * FROM patients VERSION AS OF 1</code></td></tr>
+  <tr><td>ACID transactions</td><td>❌ crash = corrupt data</td><td>✅ crash = last good snapshot survives</td></tr>
+  <tr><td>Row-level delete</td><td>Rewrite entire file</td><td>✅ small delete marker file</td></tr>
+  <tr><td>Schema evolution</td><td>Rewrite all files</td><td>✅ metadata-only change</td></tr>
+  <tr><td>Athena queryable</td><td>✅ (via Glue Catalog)</td><td>✅ (registered in Glue Catalog)</td></tr>
+</table>
+
+<div class="qa-block">
+  <div class="qa-q">Can we do GDPR erasure (patient deletion) with plain Parquet?</div>
+  <div class="qa-a">Technically yes, but it rewrites the entire file every time and leaves no audit trail.</div>
+</div>
+
+<h3>GDPR deletion: Parquet vs Iceberg</h3>
+<pre><code># PARQUET — deletes 1 row by rewriting ALL 64,335 rows:
+df = spark.read.parquet("s3://.../silver/patients/")
+df = df.filter(df.id != "patient-uuid-to-delete")
+df.write.mode("overwrite").parquet("s3://.../silver/patients/")
+# Problems:
+# - Rewrites entire file (expensive at scale)
+# - No history of when deletion happened
+# - If job crashes mid-write → data loss
+# - No audit trail for GDPR compliance</code></pre>
+
+<pre><code># ICEBERG — deletes 1 row with a tiny metadata marker:
+spark.sql("""
+    DELETE FROM glue_catalog.clinicalflow_silver.patients
+    WHERE id = 'patient-uuid-to-delete'
+""")
+# Writes a small delete marker file — original parquet untouched
+# Snapshot history records: "deletion at 2026-06-25 10:00:00"
+# Old snapshot expires after retention period → GDPR compliant</code></pre>
+
+<div class="note">
+  <strong>Interview story:</strong> "We chose Iceberg for the silver layer because GDPR erasure requires row-level deletes with an audit trail. Plain Parquet would require full file rewrites with no history. Iceberg handles it with metadata-only delete markers, preserves snapshot history for audit, and integrates natively with Glue Catalog and Athena."
+</div>
+
+<!-- ─────────────────────────────────────────────── -->
+<h2>3. Glue Job Concepts</h2>
+
+<div class="qa-block">
+  <div class="qa-q">What does F.lit() do?</div>
+  <div class="qa-a">Creates a column where every row has the same constant value. "lit" = literal value.</div>
+</div>
+<pre><code>F.lit('malformed_row_extra_fields')
+# Every row gets: quarantine_reason = 'malformed_row_extra_fields'
+
+F.lit(0), F.lit(1), F.lit(9)
+# Used in salting: F.array([F.lit(i) for i in range(10)])
+# Creates array column [0,1,2,3,4,5,6,7,8,9] for every merchant row
+# F.array() needs Spark Column objects — F.lit() wraps plain Python ints into Column objects</code></pre>
+
+<div class="qa-block">
+  <div class="qa-q">What does resolveChoice do in Glue?</div>
+  <div class="qa-a">Fixes "union struct" types — when Glue sees a column that has mixed types (e.g. sometimes double, sometimes string), it creates an ambiguous struct. resolveChoice forces one concrete type.</div>
+</div>
+<pre><code># Without resolveChoice — column looks like:
+healthcare_expenses = {'double': 41009.33, 'string': None}  # unusable as a number
+
+# With resolveChoice:
+.resolveChoice(specs=[("healthcare_expenses", "cast:double")])
+# healthcare_expenses = 41009.33  ← plain double, usable</code></pre>
+
+<div class="qa-block">
+  <div class="qa-q">What does --datalake-formats iceberg do?</div>
+  <div class="qa-a">Tells Glue to download and add Iceberg JAR files to the Spark classpath before the job starts. Without it, Spark doesn't know what GlueCatalog or S3FileIO are — like pip install for the cluster.</div>
+</div>
+
+<div class="qa-block">
+  <div class="qa-q">What does the --conf spark.sql.extensions parameter do?</div>
+  <div class="qa-a">Registers Iceberg's SQL extensions into SparkSession — enables extra syntax like time travel queries and the .writeTo() DataFrame API. Without it, .writeTo("glue_catalog...") throws an error.</div>
+</div>
+
+<div class="qa-block">
+  <div class="qa-q">What does job.commit() do?</div>
+  <div class="qa-a">Tells Glue the job completed successfully. Marks the run as SUCCEEDED and updates job bookmarks. If the job crashes before this line, Glue marks it as FAILED. Always the last line of a Glue job.</div>
+</div>
+
+<!-- ─────────────────────────────────────────────── -->
+<h2>4. Data Validation Concepts</h2>
+
+<div class="qa-block">
+  <div class="qa-q">How is the GE script different from DQDL?</div>
+  <div class="qa-a">DQDL is AWS-native, declarative, runs inside Glue automatically. GE is a Python library you write and run yourself — more flexible but runs outside AWS.</div>
+</div>
+
+<table>
+  <tr><th></th><th>GE Script</th><th>DQDL</th></tr>
+  <tr><td>Where it runs</td><td>Local machine / any Python env</td><td>Inside AWS Glue cluster</td></tr>
+  <tr><td>What it reads</td><td>S3 parquet files directly</td><td>Glue Data Catalog table</td></tr>
+  <tr><td>How checks are written</td><td>Python code — any logic</td><td>Declarative rules only</td></tr>
+  <tr><td>PHI column absence by name</td><td>✅</td><td>❌ (only by column count)</td></tr>
+  <tr><td>Divisibility check (% 5 == 0)</td><td>✅</td><td>❌</td></tr>
+  <tr><td>UUID regex</td><td>✅</td><td>✅ (added manually)</td></tr>
+  <tr><td>Results location</td><td>JSON file + stdout</td><td>Glue console + CloudWatch</td></tr>
+</table>
+
+<div class="note">
+  <strong>Why DQDL showed 16 columns when parquet had 15:</strong> The Glue Crawler added a spurious <code>partition_0</code> column to the catalog. DQDL reads catalog metadata — not S3 files. GE reads S3 files directly — so GE saw the truth (15 cols) while DQDL saw the stale metadata (16 cols). Fixed by deleting the table and recreating via CLI with <code>"PartitionKeys": []</code>.
+</div>
+
+<div class="qa-block">
+  <div class="qa-q">What is anon: False in pd.read_parquet?</div>
+  <div class="qa-a">Tells pandas to use your AWS credentials from ~/.aws/credentials. anon: True = no credentials (public buckets only). Your bucket is private so False is required — without it you get a 403.</div>
+</div>
+
+<!-- ─────────────────────────────────────────────── -->
+<h2>5. S3 + Parquet Concepts</h2>
+
+<div class="qa-block">
+  <div class="qa-q">Where are the actual parquet files and how were they created?</div>
+  <div class="qa-a">The Glue ETL job created them with one line: <code>patients_deid.write.mode("overwrite").parquet("s3://.../silver/patients/")</code>. Spark serialised the DataFrame and wrote it as a snappy-compressed parquet file to S3.</div>
+</div>
+
+<div class="qa-block">
+  <div class="qa-q">What does the part-00000 prefix mean?</div>
+  <div class="qa-a">Spark splits large outputs across multiple files — one per executor task. part-00000 = first (and only) file. A billion-row job might produce part-00000 through part-00199. Small datasets like our 64K patients produce just one file.</div>
+</div>
+
+<div class="qa-block">
+  <div class="qa-q">How do I quickly check what's in any S3 parquet file locally?</div>
+  <div class="qa-a">Use pd.read_parquet() — it bypasses Glue Catalog entirely and reads the raw files. Fastest debug tool for silver/quarantine data.</div>
+</div>
+<pre><code>source ~/myenv/bin/activate
+python3 -c "
+import pandas as pd
+df = pd.read_parquet('s3://clinicalflow-datalake-941141114246/silver/patients/',
+                     storage_options={'anon': False})
+print(len(df), 'rows,', len(df.columns), 'cols')
+print(df.columns.tolist())
+print(df.iloc[0])
+"</code></pre>
+
+</body>
+</html>
