@@ -173,7 +173,7 @@ python3 validation/ge_validate_silver_patients.py
 | 13 | Iceberg silver | Converted silver/patients from Parquet to Iceberg v2. Resolved 3 catalog config errors (see Debugging Log). GE 17/17 re-validated on Iceberg output | ✅ | 2026-06-25 |
 | 14 | dim_patient_consent | GDPR consent table with erasure flag | ⏳ | — |
 | 15 | Redshift gold | Column-level privileges, analytical views | ⏳ | — |
-| 16 | EMR Serverless | 10-year readmission aggregation job | ⏳ | — |
+| 16 | EMR Serverless | PySpark readmission aggregation — window functions, 30-day flag, gold/readmission_summary/ Parquet output | ✅ | 2026-06-25 |
 
 ---
 
