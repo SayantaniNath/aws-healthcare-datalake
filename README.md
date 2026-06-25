@@ -170,7 +170,7 @@ python3 validation/ge_validate_silver_patients.py
 | 10 | Malformed row discovery | Found 3 rows (lines 60385/60401/64324) where two records concatenated on one line — caused Glue to create union struct types on numeric cols and overflow col28–col35 columns | 🔍 | 2026-06-24 |
 | 11 | Glue ETL v2 | Fixed job: added address/drivers/maiden to drop list; added resolveChoice for numeric cols; added quarantine step for malformed rows; fixed IAM (added s3:DeleteObject); removed duplicate job.commit() | ✅ | 2026-06-24 |
 | 12 | DQDL ruleset | Created `clinicalflow-silver-patients-phi-audit` ruleset on silver patients table — 8 rules. Fixed partition_0 issue (crawler added spurious partition key — deleted table, recreated via CLI with PartitionKeys:[]). 8/8 passing | ✅ | 2026-06-24 |
-| 13 | Iceberg silver | Added Iceberg job params (`--datalake-formats iceberg`) and spark catalog config to ETL job — pending first run | 🟡 | — |
+| 13 | Iceberg silver | Converted silver/patients from Parquet to Iceberg v2. Resolved 3 catalog config errors (see Debugging Log). GE 17/17 re-validated on Iceberg output | ✅ | 2026-06-25 |
 | 14 | dim_patient_consent | GDPR consent table with erasure flag | ⏳ | — |
 | 15 | Redshift gold | Column-level privileges, analytical views | ⏳ | — |
 | 16 | EMR Serverless | 10-year readmission aggregation job | ⏳ | — |
@@ -410,6 +410,26 @@ spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExte
 ```
 
 Think of it as two layers: `SparkCatalog` is the Spark-facing plugin; `GlueCatalog` is the AWS-facing storage backend underneath it.
+
+---
+
+**Error 3: `Input Glue table is not an iceberg table: glue_catalog.clinicalflow_silver.patients (type=null)`**
+
+```
+An error occurred while calling createOrReplace.
+Input Glue table is not an iceberg table:
+glue_catalog.clinicalflow_silver.patients (type=null)
+```
+
+Cause: Catalog config was now working correctly (progress from Error 2), but the existing `clinicalflow_silver.patients` table in the Glue catalog was a plain Parquet table created by earlier job runs. `createOrReplace()` found it, saw it was not Iceberg format, and refused to overwrite it.
+
+Fix: Delete the existing non-Iceberg table from the Glue catalog, then run the job. `createOrReplace()` creates a fresh Iceberg table when none exists.
+
+```bash
+aws glue delete-table --database-name clinicalflow_silver --name patients
+```
+
+After this, the job succeeded. Iceberg write confirmed by presence of `metadata/` folder in `s3://clinicalflow-datalake-941141114246/silver/patients/` — this is the snapshot metadata layer that Parquet does not have. GE validation re-run: 17/17 passing on the Iceberg output.
 
 ---
 
