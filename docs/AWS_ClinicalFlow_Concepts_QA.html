@@ -261,5 +261,110 @@ print(df.columns.tolist())
 print(df.iloc[0])
 "</code></pre>
 
+
+<h2>Section 6 — Errors, Root Causes &amp; Interview Framing</h2>
+<p style="color:var(--muted)">Every error faced during the ClinicalFlow build — what caused it, how it was diagnosed, how it was fixed, and how to explain it in an interview.</p>
+
+<h3>E1 — IAM: s3:DeleteObject not authorized</h3>
+<table>
+<tr><th>Error</th><td><code>AccessDeniedException: not authorized to perform s3:DeleteObject</code></td></tr>
+<tr><th>When</th><td>Glue ETL job, <code>write.mode("overwrite")</code> on silver/patients</td></tr>
+<tr><th>Root cause</th><td>Overwrite deletes existing files before writing new ones. Glue IAM role only had s3:PutObject — missing s3:DeleteObject.</td></tr>
+<tr><th>Fix</th><td>Added <code>s3:DeleteObject</code> to the Glue role inline policy for the bucket.</td></tr>
+<tr><th>Interview framing</th><td>"I got an AccessDeniedException on overwrite. I read the error — it named the exact action and resource. I added s3:DeleteObject to the role policy. General rule: AWS errors always tell you the missing action and the resource ARN."</td></tr>
+</table>
+
+<h3>E2 — Glue: Union struct types on numeric columns</h3>
+<table>
+<tr><th>Error</th><td>Silver output had struct type <code>&#123;'double': 41009.33, 'string': None&#125;</code> instead of plain double</td></tr>
+<tr><th>When</th><td>Glue ETL job reading patients CSV with 3 malformed rows</td></tr>
+<tr><th>Root cause</th><td>3 rows had two records concatenated on one line. Glue saw both numeric and string values in the same column and inferred an ambiguous union type.</td></tr>
+<tr><th>Fix</th><td><code>resolveChoice(specs=[("healthcare_expenses","cast:double"), ...])</code> on the DynamicFrame before <code>.toDF()</code>.</td></tr>
+<tr><th>Interview framing</th><td>"Glue's dynamic typing backfired on malformed rows. resolveChoice forces a concrete type — it's the Glue-specific fix for union struct types. The root cause was source data quality, which we handled by quarantining the 3 bad rows separately."</td></tr>
+</table>
+
+<h3>E3 — PHI gap: address, drivers, maiden survived de-identification</h3>
+<table>
+<tr><th>Error</th><td>Silver layer contained full street address, driver's license numbers, and maiden names</td></tr>
+<tr><th>When</th><td>Discovered during PHI column audit after first ETL run</td></tr>
+<tr><th>Root cause</th><td>Initial drop list covered only the most obvious Safe Harbor fields. Three less-obvious identifiers were missed.</td></tr>
+<tr><th>Fix</th><td>Audited all 28 raw columns against HIPAA Safe Harbor §164.514(b)(2). Added address, drivers, maiden to cols_to_drop.</td></tr>
+<tr><th>Interview framing</th><td>"This taught me to do a structured audit against the regulation, not just drop columns by intuition. I mapped every column to its Safe Harbor category. The two-layer validation (GE + DQDL) was added partly because of this miss."</td></tr>
+</table>
+
+<h3>E4 — DQDL: ColumnCount = 15 failing with 16 (partition_0)</h3>
+<table>
+<tr><th>Error</th><td>DQDL rule <code>ColumnCount = 15</code> reported actual count 16</td></tr>
+<tr><th>When</th><td>After Glue Crawler created the clinicalflow_silver.patients table</td></tr>
+<tr><th>Root cause</th><td>Glue Crawler auto-added a spurious <code>partition_0</code> partition key to the catalog table. DQDL reads the catalog schema, not S3 files directly — so it counted 16.</td></tr>
+<tr><th>Fix</th><td>Deleted the crawler-created table. Recreated via CLI with <code>"PartitionKeys": []</code>. <code>aws glue update-table</code> failed because indexes were enabled — must delete and recreate.</td></tr>
+<tr><th>Interview framing</th><td>"Key lesson: DQDL and GE validate different things. DQDL reads the Glue Catalog schema; GE reads S3 files directly. When they disagree, the ground truth is S3. Always verify at the data layer before debugging the catalog."</td></tr>
+</table>
+
+<h3>E5 — GE: ArrowInvalid path normalization error</h3>
+<table>
+<tr><th>Error</th><td><code>ArrowInvalid: GetFileInfo() yielded path outside base dir</code></td></tr>
+<tr><th>When</th><td>GE validation script reading silver Parquet from S3 using s3fs + pyarrow</td></tr>
+<tr><th>Root cause</th><td>pyarrow.parquet.ParquetDataset normalises S3 paths internally, producing a path that doesn't match the base dir prefix when used with s3fs filesystem.</td></tr>
+<tr><th>Fix</th><td>Replaced <code>pq.ParquetDataset(path, filesystem=fs)</code> with <code>pd.read_parquet(path, storage_options=&#123;"anon": False&#125;)</code>.</td></tr>
+<tr><th>Interview framing</th><td>"Library version conflict between s3fs and pyarrow path handling. Fix was to use pandas read_parquet with storage_options instead of the lower-level pyarrow API — simpler and more stable."</td></tr>
+</table>
+
+<h3>E6 — Iceberg Error 1: REQUIRES_SINGLE_PART_NAMESPACE</h3>
+<table>
+<tr><th>Error</th><td><code>spark_catalog requires a single-part namespace, but got glue_catalog.clinicalflow_silver</code></td></tr>
+<tr><th>When</th><td>Glue ETL job, first attempt at Iceberg write</td></tr>
+<tr><th>Root cause</th><td>Glue job parameters are a JSON dict — duplicate <code>--conf</code> keys mean only the last value survives. All four catalog conf settings were added as separate <code>--conf</code> rows, so only the last one was applied. <code>glue_catalog</code> was never registered as a catalog.</td></tr>
+<tr><th>Fix</th><td>Chain all <code>--conf</code> values into a single key's value, space-separated: <code>spark.sql.extensions=A --conf spark.sql.catalog.glue_catalog=B --conf ...</code></td></tr>
+<tr><th>Interview framing</th><td>"Glue job parameters are a flat dict — no duplicate keys. Multi-value Spark conf must be chained in one string. Also learned that spark.conf.set() after SparkContext starts is too late for catalog plugin registration — must be in job params."</td></tr>
+</table>
+
+<h3>E7 — Iceberg Error 2: Plugin class does not implement CatalogPlugin</h3>
+<table>
+<tr><th>Error</th><td><code>Plugin class for catalog 'glue_catalog' does not implement CatalogPlugin: org.apache.iceberg.aws.glue.GlueCatalog</code></td></tr>
+<tr><th>When</th><td>Glue ETL job, after fixing the chained --conf issue</td></tr>
+<tr><th>Root cause</th><td><code>GlueCatalog</code> is an Iceberg catalog implementation (storage backend) — it does NOT implement Spark's <code>CatalogPlugin</code> interface. The Spark-facing plugin class is <code>SparkCatalog</code>.</td></tr>
+<tr><th>Fix</th><td>Use <code>spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog</code> with <code>catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog</code>. Two layers: SparkCatalog (Spark interface) wraps GlueCatalog (AWS backend).</td></tr>
+<tr><th>Interview framing</th><td>"The error message was literal — GlueCatalog doesn't implement CatalogPlugin. Iceberg has two layers: SparkCatalog is the Spark-facing plugin, GlueCatalog is the AWS-facing storage backend. The AWS docs I found were outdated for Iceberg 1.x."</td></tr>
+</table>
+
+<h3>E8 — Iceberg Error 3: Input Glue table is not an iceberg table</h3>
+<table>
+<tr><th>Error</th><td><code>Input Glue table is not an iceberg table: glue_catalog.clinicalflow_silver.patients (type=null)</code></td></tr>
+<tr><th>When</th><td>Glue ETL job, after fixing the CatalogPlugin error</td></tr>
+<tr><th>Root cause</th><td>The existing <code>clinicalflow_silver.patients</code> table was created as plain Parquet by earlier job runs. <code>createOrReplace()</code> found a non-Iceberg table and refused to convert it.</td></tr>
+<tr><th>Fix</th><td><code>aws glue delete-table --database-name clinicalflow_silver --name patients</code> then rerun. <code>createOrReplace()</code> creates a fresh Iceberg table when none exists.</td></tr>
+<tr><th>Interview framing</th><td>"Format migration isn't automatic — you can't createOrReplace a Parquet table with Iceberg in place. Delete the old catalog entry, let the Iceberg write create it fresh. The data in S3 is overwritten anyway."</td></tr>
+</table>
+
+<h3>E9 — EMR Serverless: KMS Decrypt permission missing</h3>
+<table>
+<tr><th>Error</th><td><code>403 AccessDeniedException: lacks kms:Decrypt permission on key arn:aws:kms:us-east-1:941141114246:key/af5fa1f6-...</code></td></tr>
+<tr><th>When</th><td>EMR Serverless job reading the script file from KMS-encrypted S3 bucket</td></tr>
+<tr><th>Root cause</th><td>The EMR execution role had S3 access but not KMS access. All objects in the bucket are SSE-KMS encrypted — reading any object requires kms:Decrypt on the CMK.</td></tr>
+<tr><th>Fix</th><td>Added inline policy to <code>EMRServerlessRole-clinicalflow</code> with <code>kms:Decrypt</code> and <code>kms:GenerateDataKey</code> on the CMK ARN.</td></tr>
+<tr><th>Interview framing</th><td>"Standard pattern: whenever a role touches an SSE-KMS encrypted bucket, it needs kms:Decrypt to read and kms:GenerateDataKey to write. The error gave the exact key ARN — add both actions as a pair, not just Decrypt."</td></tr>
+</table>
+
+<h3>E10 — EMR Serverless: Ambiguous column reference after join</h3>
+<table>
+<tr><th>Error</th><td><code>AnalysisException: Ambiguous column reference — Id exists in multiple tables</code></td></tr>
+<tr><th>When</th><td>EMR readmission job, aggregation after joining encounters + patients</td></tr>
+<tr><th>Root cause</th><td>After joining, the DataFrame had both <code>Id</code> (encounter ID from encounters) and <code>id</code> (patient ID from patients). Spark is case-insensitive for column names — both resolve to the same name, making <code>F.count("Id")</code> ambiguous.</td></tr>
+<tr><th>Fix</th><td>Renamed encounters <code>Id</code> to <code>encounter_id</code> before the join with <code>withColumnRenamed("Id", "encounter_id")</code>.</td></tr>
+<tr><th>Interview framing</th><td>"Classic join column collision — both tables had a column called id. Always rename ambiguous columns before joining, especially when joining on different column names. Spark column references are case-insensitive so Id and id clash."</td></tr>
+</table>
+
+<h3>General Troubleshooting Framework</h3>
+<table>
+<tr><th>Error type</th><th>First thing to check</th></tr>
+<tr><td>AccessDeniedException</td><td>Error names the exact action and resource ARN — add that action to the IAM policy</td></tr>
+<tr><td>DQDL rule failing</td><td>Check S3 directly with pandas — DQDL reads catalog, not files. Stale catalog = wrong results</td></tr>
+<tr><td>Glue union struct types</td><td>Raw data has malformed rows — use resolveChoice to force concrete types</td></tr>
+<tr><td>Iceberg catalog errors</td><td>SparkCatalog = Spark plugin, GlueCatalog = backend. Catalog config must be in job params, not spark.conf.set()</td></tr>
+<tr><td>Ambiguous column after join</td><td>Both DataFrames have same column name — rename before join with withColumnRenamed()</td></tr>
+<tr><td>KMS 403 on S3</td><td>Add kms:Decrypt + kms:GenerateDataKey as a pair on the CMK ARN</td></tr>
+</table>
+
 </body>
 </html>
