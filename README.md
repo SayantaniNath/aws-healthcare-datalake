@@ -1,205 +1,260 @@
-# AWS Healthcare Data Lake — ClinicalFlow
+# ClinicalFlow — AWS Healthcare Data Lakehouse
 
-A production-grade, HIPAA-compliant healthcare data lakehouse built on AWS, demonstrating end-to-end data engineering across ingestion, de-identification, validation, transformation, and orchestration.
+A portfolio-grade data engineering project demonstrating a production-style healthcare data lakehouse on AWS. Built on 64,338 synthetic patients (Synthea EHR) with full HIPAA Safe Harbor de-identification, GDPR erasure support, multi-layer data quality validation, and an Iceberg-based silver layer.
 
 ---
 
 ## Architecture Overview
 
 ```
-Synthea EHR (64K patients × 10 years)
-         │
-         ▼
-  S3 Raw Layer  ──────────────────────────────────────────────────────┐
-  (KMS encrypted)                                                      │
-  s3://clinicalflow-datalake/raw/synthea/csv/                         │ CloudTrail
-         │                                                             │ Audit Log
-         ▼                                                             │
-  AWS Glue Crawler                                                     │
-  (Auto-schema discovery → clinicalflow_raw catalog)                  │
-         │                                                             │
-         ▼                                                             │
-  AWS Glue ETL — HIPAA Safe Harbor De-identification                  │
-  (Drop PII · Tokenize IDs · Age-bucket · Zip-prefix)                │
-         │                                                             │
-         ▼                                                             │
-  S3 Silver Layer (De-identified Parquet / Iceberg)                   │
-  s3://clinicalflow-datalake/silver/                                  │
-         │                                                             │
-         ▼                                                             │
-  Great Expectations Validation                                        │
-  (Assert no PHI leak · Schema checks · Audit report)                 │
-         │                                                             │
-         ▼                                                             │
-  S3 Gold Layer → Amazon Redshift                                     │
-  (Analytical views · Column-level privileges)                        │
-         │                                                             │
-         ▼                                                             │
-  Amazon EMR Serverless                                                │
-  (10-year readmission aggregation at scale)                          │
-         │                                                             │
-         ▼                                                             │
-  Apache Airflow (MWAA) Orchestration                  ───────────────┘
+Synthea EHR (CSV, 8.2 GB)
+        │
+        ▼
+S3 raw/synthea/csv/          ← SSE-KMS encrypted (alias/clinicalflow-cmk)
+        │
+        ▼
+Glue Crawler                 ← clinicalflow-raw-crawler → clinicalflow_raw catalog
+        │
+        ▼
+Glue ETL Job                 ← hipaa_deid_patients.py
+  ├── resolveChoice           ← fix union struct types from malformed rows
+  ├── Quarantine              ← 3 malformed rows → quarantine/patients/ with audit timestamp
+  ├── HIPAA Safe Harbor       ← drop 14 PHI columns, tokenize ID, truncate zip, age-bucket
+  └── Write                   ← silver/patients/ as Iceberg v2
+        │
+        ▼
+S3 silver/patients/          ← Iceberg table, 15 clean columns, 64,335 rows
+        │
+        ├── GE validation     ← ge_validate_silver_patients.py (17 checks)
+        └── DQDL ruleset      ← clinicalflow-silver-patients-phi-audit (8 rules)
 ```
 
 ---
 
 ## Dataset
 
-- **Source:** [Synthea](https://github.com/synthetichealth/synthea) — open-source synthetic EHR generator
-- **Scale:** 64,338 patients × 10 years of clinical history (Massachusetts)
-- **Size:** ~8.2 GB across 16 CSV tables
-- **Key tables:** patients, encounters, claims, conditions, medications, procedures, imaging_studies, immunizations, allergies, careplans, devices, payer_transitions, payers, providers, organizations, supplies
-- **Format:** FHIR R4 JSON + CSV (no real patient data — 100% synthetic, GitHub-safe)
+| Property | Value |
+|---|---|
+| Source | Synthea synthetic EHR (no real patient data) |
+| Patients | 64,338 |
+| Time span | 10 years |
+| State | Massachusetts, seed 42 |
+| Raw files | 16 CSVs, 8.2 GB |
+| Key tables | patients, encounters, conditions, procedures, medications, claims |
+
+**Data quality note:** 3 malformed rows exist in `patients.csv` (lines 60385, 60401, 64324) where two patient records were concatenated on one line due to a missing newline in Synthea output. Detected and quarantined by the ETL job — silver receives only fully-formed records.
 
 ---
 
-## AWS Stack
+## AWS Infrastructure
 
-| Service | Role |
+| Component | Detail |
 |---|---|
-| **S3** | Raw / Silver / Gold storage layers |
-| **KMS (CMK)** | Customer-managed encryption key — HIPAA-grade encryption at rest |
-| **CloudTrail** | Audit trail — every S3 read/write logged for HIPAA compliance |
-| **AWS Glue Crawler** | Auto-schema discovery → Data Catalog |
-| **AWS Glue ETL** | PySpark-based HIPAA Safe Harbor de-identification |
-| **Amazon Redshift** | Gold layer analytical warehouse with column-level privileges |
-| **EMR Serverless** | Large-scale batch aggregation (10-year readmission cohort) |
-| **Amazon Kinesis** | Real-time streaming ingest path |
-| **AWS Lambda** | Stream enrichment |
-| **MWAA (Airflow)** | Pipeline orchestration and SLA monitoring |
-| **IAM** | Role-based access control per service |
+| Account | 941141114246 |
+| Region | us-east-1 |
+| S3 bucket | `clinicalflow-datalake-941141114246` |
+| KMS key | `alias/clinicalflow-cmk` (SSE-KMS on all data) |
+| CloudTrail | `clinicalflow-audit-trail` — logs all S3 data events, KMS encrypted |
+| Glue role | `AWSGlueServiceRole-clinicalflow` |
+| Glue databases | `clinicalflow_raw` (17 tables), `clinicalflow_silver` (patients) |
+
+**S3 folder structure:**
+```
+clinicalflow-datalake-941141114246/
+├── raw/synthea/csv/          ← 16 Synthea CSV files
+├── silver/patients/          ← Iceberg de-identified patients
+├── quarantine/patients/      ← malformed source rows with audit metadata
+├── gold/                     ← Redshift-ready aggregates (pending)
+└── cloudtrail-logs/          ← CloudTrail audit logs
+```
 
 ---
 
 ## HIPAA Safe Harbor De-identification
 
-Implemented per 45 CFR §164.514(b) — Safe Harbor method. The following transformations are applied to the patients table before writing to the silver layer:
+**Job:** `glue_jobs/hipaa_deid_patients.py`
 
-| Field | Transformation | Reason |
+Safe Harbor § 164.514(b)(2) requires removal of 18 identifier categories. Applied transformations:
+
+| Transformation | Columns | Notes |
 |---|---|---|
-| `first`, `middle`, `last` | **Removed** | Direct name identifier |
-| `ssn` | **Removed** | Direct identifier |
-| `passport` | **Removed** | Direct identifier |
-| `prefix`, `suffix` | **Removed** | Quasi-identifier |
-| `lat`, `lon` | **Removed** | Precise geographic location |
-| `id` (patient ID) | **Tokenized → UUID** | Breaks re-identification linkage |
-| `birthdate` | **Age-bucketed → 5-year range** | Dates must be reduced under Safe Harbor |
-| `deathdate` | **Removed** | Date field — Safe Harbor requirement |
-| `zip` | **Truncated → 3-digit prefix** | Geographic quasi-identifier |
-| `gender`, `race`, `ethnicity` | **Retained** | Permitted under Safe Harbor |
-| `income`, `healthcare_expenses` | **Retained** | Not PHI |
+| **Dropped** | first, middle, last, maiden | Names including maiden name |
+| **Dropped** | ssn, passport, drivers | Government IDs (drivers = license number e.g. S99956685; present for 52K/64K patients) |
+| **Dropped** | prefix, suffix | Name qualifiers |
+| **Dropped** | address | Full street address |
+| **Dropped** | lat, lon | Geographic coordinates (below county level = PHI) |
+| **Dropped** | birthdate, deathdate | Dates |
+| **Tokenized** | id | Original UUID → new random UUID (breaks re-identification linkage) |
+| **Truncated** | zip | 5-digit → 3-digit prefix (Safe Harbor geographic standard) |
+| **Age-bucketed** | birthdate | Birth year → 5-year range e.g. 1962 → 1960, stored as `birth_year_bucket` |
+
+**Retained columns (15 total):**
+`id` (tokenized), `marital`, `race`, `ethnicity`, `gender`, `birthplace`, `city`, `state`, `county`, `fips`, `zip` (truncated), `healthcare_expenses`, `healthcare_coverage`, `income`, `birth_year_bucket`
+
+**Glue job internals:**
+- `resolveChoice` — fixes union struct types (`{'double': x, 'string': None}`) caused by 3 malformed rows in raw CSV where Glue inferred ambiguous column types
+- Quarantine step — `reduce(lambda a, b: a | b, [col(c).isNotNull() for c in overflow_cols])` detects malformed rows by checking for non-null values in overflow `col*` columns; writes to `quarantine/patients/` with `quarantine_reason` and `quarantine_ts` before de-id runs
+- Iceberg write — `--datalake-formats iceberg` Glue job param, writes via `.writeTo("glue_catalog.clinicalflow_silver.patients").createOrReplace()`
 
 ---
 
-## Data Profiling
+## Data Quality Validation
 
-**Tool:** [Sweetviz](https://github.com/fbdesignpro/sweetviz)
+Two-layer validation: AWS-native pipeline gate + independent audit.
 
-Before de-identification, a full HTML profile report is generated for `patients.csv` and `encounters.csv` to:
-- Identify all PHI columns
-- Document data types, missing values, and distributions
-- Provide audit evidence that PHI was identified before removal
+### Layer 1 — AWS Glue Data Quality (DQDL)
 
+**Ruleset:** `clinicalflow-silver-patients-phi-audit`
+**Table:** `clinicalflow_silver.patients`
+**Result:** 8/8 rules passing ✅
+
+```
+Rules = [
+    RowCount > 0,
+    IsComplete "id",
+    IsComplete "birth_year_bucket",
+    ColumnCount = 15,
+    ColumnValues "zip" matches "[0-9]{1,3}",
+    ColumnValues "gender" in ["M", "F"],
+    Completeness "race" > 0.99,
+    ColumnValues "id" matches "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+]
+```
+
+| Rule | What it catches |
+|---|---|
+| `RowCount > 0` | Output not empty |
+| `IsComplete "id"` | Every patient has a surrogate key |
+| `IsComplete "birth_year_bucket"` | Age bucketing ran on every row |
+| `ColumnCount = 15` | Tripwire — if any PHI column survived, count goes above 15 |
+| `zip matches "[0-9]{1,3}"` | No 5-digit zips survived truncation |
+| `gender in ["M", "F"]` | Sanity check on Synthea demographics |
+| `Completeness "race" > 0.99` | Synthea always generates race — mass nulls = pipeline error |
+| `id matches UUID regex` | Tokenisation worked, no original Synthea IDs remain |
+
+### Layer 2 — Great Expectations (independent audit)
+
+**Script:** `validation/ge_validate_silver_patients.py`
+**Result:** 17/17 checks passing ✅
+**Reports:** `validation/reports/ge_silver_patients_<timestamp>.json`
+
+| Category | Checks |
+|---|---|
+| PHI column absence by name | first, middle, last, ssn, passport, prefix, suffix, lat, lon, birthdate, deathdate — 11 checks |
+| zip ≤ 3 chars | 1 check |
+| birth_year_bucket not null + divisible by 5 | 2 checks |
+| id not null + UUID regex | 2 checks |
+| Row count > 0 | 1 check |
+
+**Run locally:**
 ```bash
-pip install sweetviz
-python profiling/profile_patients.py
-# Output: ~/Downloads/patients_profile.html
+source ~/myenv/bin/activate
+python3 validation/ge_validate_silver_patients.py
 ```
 
 ---
 
-## Data Validation
+## Phase 1 Step-by-Step Progress
 
-**Tool:** [Great Expectations](https://greatexpectations.io/)
-
-After de-identification, GE assertions run against the silver layer output to prove no PHI leaked:
-
-- `ssn` column must not exist
-- `first`, `last` columns must not exist
-- `zip` length must be ≤ 3 characters
-- `birthdate` column must not exist
-- `id` must be UUID format (not original patient ID)
-- `birth_year_bucket` must be divisible by 5
-
-GE generates an HTML validation report that serves as the compliance audit artifact.
+| # | Step | What was done | Status | Date |
+|---|---|---|---|---|
+| 1 | Synthea data generation | Generated 64,338 synthetic patients × 10yr, Massachusetts, seed 42. 16 CSV files, 8.2 GB to ~/output/csv/ | ✅ | 2026-06-22 |
+| 2 | KMS CMK | Created customer-managed KMS key `alias/clinicalflow-cmk` for SSE-KMS encryption on all S3 data | ✅ | 2026-06-23 |
+| 3 | S3 bucket | Created `clinicalflow-datalake-941141114246` — block all public access, versioning ON, SSE-KMS default encryption | ✅ | 2026-06-23 |
+| 4 | CloudTrail | Created `clinicalflow-audit-trail` logging all S3 data events (GetObject, PutObject, DeleteObject) to `cloudtrail-logs/`, KMS encrypted | ✅ | 2026-06-23 |
+| 5 | Upload raw CSVs | Uploaded all 16 CSVs to `raw/synthea/csv/` with SSE-KMS using `alias/clinicalflow-cmk` | ✅ | 2026-06-23 |
+| 6 | Glue Crawler (raw) | `clinicalflow-raw-crawler` crawled raw/ prefix — created 17 tables in `clinicalflow_raw` database | ✅ | 2026-06-23 |
+| 7 | Glue ETL v1 | Initial de-id job — dropped first/middle/last/ssn/passport/prefix/suffix/lat/lon; tokenized id; truncated zip; age-bucketed birthdate. **Gap found later:** address, drivers, maiden were not dropped | ✅ | 2026-06-24 |
+| 8 | GE validation (first run) | Ran ge_validate_silver_patients.py — 17/17 passed on PHI cols but silver still had address/drivers/maiden (not in PHI_COLS list at the time) | ✅ | 2026-06-24 |
+| 9 | PHI gap discovery | Inspected raw patients.csv columns — found address (full street address), drivers (license numbers e.g. S99956685, 52K/64K rows), maiden (16K rows) were direct identifiers not in original drop list | 🔍 | 2026-06-24 |
+| 10 | Malformed row discovery | Found 3 rows (lines 60385/60401/64324) where two records concatenated on one line — caused Glue to create union struct types on numeric cols and overflow col28–col35 columns | 🔍 | 2026-06-24 |
+| 11 | Glue ETL v2 | Fixed job: added address/drivers/maiden to drop list; added resolveChoice for numeric cols; added quarantine step for malformed rows; fixed IAM (added s3:DeleteObject); removed duplicate job.commit() | ✅ | 2026-06-24 |
+| 12 | DQDL ruleset | Created `clinicalflow-silver-patients-phi-audit` ruleset on silver patients table — 8 rules. Fixed partition_0 issue (crawler added spurious partition key — deleted table, recreated via CLI with PartitionKeys:[]). 8/8 passing | ✅ | 2026-06-24 |
+| 13 | Iceberg silver | Added Iceberg job params (`--datalake-formats iceberg`) and spark catalog config to ETL job — pending first run | 🟡 | — |
+| 14 | dim_patient_consent | GDPR consent table with erasure flag | ⏳ | — |
+| 15 | Redshift gold | Column-level privileges, analytical views | ⏳ | — |
+| 16 | EMR Serverless | 10-year readmission aggregation job | ⏳ | — |
 
 ---
 
-## Project Structure
+## Key Debugging Lessons
+
+**Issue: DQDL ColumnCount = 15 failing with 16**
+Cause: Glue Crawler auto-detected a `partition_0` column that doesn't exist in the parquet files.
+Fix: Deleted the crawler-created table, recreated via CLI with `"PartitionKeys": []`.
+Lesson: DQDL evaluates Glue Catalog schema, not S3 files. Always verify at the actual data layer first.
+
+```bash
+# Ground truth check — bypasses catalog entirely
+python3 -c "
+import pandas as pd
+df = pd.read_parquet('s3://clinicalflow-datalake-941141114246/silver/patients/',
+                     storage_options={'anon': False})
+print(len(df.columns), 'columns:', df.columns.tolist())
+"
+```
+
+**Issue: Union struct types in silver output**
+Cause: 3 malformed rows in raw CSV caused Glue to infer columns like `healthcare_expenses` as either double or string → struct type `{'double': 41009.33, 'string': None}`.
+Fix: `resolveChoice(specs=[("healthcare_expenses", "cast:double"), ...])` on the DynamicFrame before `.toDF()`.
+
+**Issue: PHI columns address/drivers/maiden survived de-id**
+Cause: Original drop list only covered the most obvious Safe Harbor fields.
+Fix: Audited all 28 raw columns against Safe Harbor § 164.514(b)(2) — added 3 missed identifiers.
+
+---
+
+## Local Debug Commands
+
+```bash
+source ~/myenv/bin/activate
+
+# Check silver output
+python3 -c "
+import pandas as pd
+df = pd.read_parquet('s3://clinicalflow-datalake-941141114246/silver/patients/',
+                     storage_options={'anon': False})
+print(len(df), 'rows,', len(df.columns), 'cols:', df.columns.tolist())
+print(df.iloc[0])
+"
+
+# Check quarantine rows
+python3 -c "
+import pandas as pd
+df = pd.read_parquet('s3://clinicalflow-datalake-941141114246/quarantine/patients/',
+                     storage_options={'anon': False})
+print(df[['quarantine_reason','quarantine_ts']])
+"
+
+# Run GE PHI audit
+python3 validation/ge_validate_silver_patients.py
+
+# List S3 prefixes
+aws s3 ls s3://clinicalflow-datalake-941141114246/silver/patients/
+aws s3 ls s3://clinicalflow-datalake-941141114246/quarantine/patients/
+
+# Check Glue catalog table schema
+aws glue get-table --database-name clinicalflow_silver --name patients
+```
+
+---
+
+## Repository Structure
 
 ```
 aws-healthcare-datalake/
 ├── glue_jobs/
-│   └── hipaa_deid_patients.py     # HIPAA Safe Harbor de-id ETL job
+│   └── hipaa_deid_patients.py         ← HIPAA de-id ETL + quarantine + Iceberg write
+├── validation/
+│   ├── ge_validate_silver_patients.py ← GE PHI audit (17 checks)
+│   └── reports/                       ← timestamped JSON reports per run
 ├── profiling/
-│   └── profile_patients.py        # Sweetviz PHI discovery report
-├── infrastructure/
-│   └── setup.md                   # KMS, S3, IAM, CloudTrail setup notes
-├── .gitignore
+│   └── profile_patients.py            ← ydata-profiling for PHI discovery
 └── README.md
 ```
 
 ---
 
-## Infrastructure Setup
+## Interview Story
 
-### S3 Bucket
-- **Name:** `clinicalflow-datalake-941141114246`
-- **Encryption:** SSE-KMS with customer-managed key (`alias/clinicalflow-cmk`)
-- **Versioning:** Enabled
-- **Public access:** Blocked
-
-### KMS
-- **Alias:** `alias/clinicalflow-cmk`
-- **Usage:** Encrypts all S3 objects; CloudTrail logs; Glue job outputs
-- **Key policy:** Grants decrypt to Glue service principal and CloudTrail
-
-### CloudTrail
-- **Trail:** `clinicalflow-audit-trail`
-- **Logs to:** `s3://clinicalflow-datalake-941141114246/cloudtrail-logs/`
-- **Events:** Management + S3 data events (Read + Write)
-
-### Glue
-- **Crawler:** `clinicalflow-raw-crawler` → database `clinicalflow_raw` (17 tables)
-- **ETL Role:** `AWSGlueServiceRole-clinicalflow` with S3 + KMS inline policies
-
----
-
-## Running the Pipeline
-
-```bash
-# 1. Run Glue Crawler (catalog raw CSVs)
-aws glue start-crawler --name clinicalflow-raw-crawler
-
-# 2. Run HIPAA de-identification ETL
-aws glue start-job-run --job-name clinicalflow-hipaa-deid-patients
-
-# 3. Verify silver output
-aws s3 ls s3://clinicalflow-datalake-941141114246/silver/patients/
-```
-
----
-
-## Portfolio Interview Story
-
-> "Built a HIPAA-compliant healthcare data lakehouse on AWS processing 64K synthetic EHR patients across 16 clinical tables at 8+ GB scale. Implemented HIPAA Safe Harbor de-identification using AWS Glue PySpark — tokenizing patient IDs, age-bucketing dates, and truncating geographic identifiers — with full PHI audit trail via CloudTrail and Great Expectations validation reports. Architecture spans S3 raw/silver/gold layers with KMS customer-managed encryption, Glue Data Catalog, EMR Serverless for large-scale aggregation, Kinesis+Lambda for real-time streaming, and MWAA for orchestration."
-
----
-
-## Status
-
-| Phase | Status |
-|---|---|
-| Synthea data generation (64K patients) | ✅ Done |
-| S3 bucket + KMS + CloudTrail | ✅ Done |
-| Glue Crawler → Data Catalog (17 tables) | ✅ Done |
-| HIPAA Safe Harbor de-id ETL (patients) | ✅ Done |
-| Sweetviz PHI profiling | ✅ Done |
-| Great Expectations validation | ⏳ Next |
-| Iceberg silver tables | ⏳ |
-| GDPR consent table | ⏳ |
-| Redshift gold layer | ⏳ |
-| EMR Serverless readmission aggregation | ⏳ |
-| Kinesis + Lambda streaming path | ⏳ |
-| MWAA orchestration | ⏳ |
+> "Built ClinicalFlow — a healthcare data lakehouse on AWS processing 64K synthetic EHR patients. Ingests raw Synthea CSVs into S3 with SSE-KMS encryption and CloudTrail audit logging. A Glue ETL job applies HIPAA Safe Harbor de-identification: drops 14 direct identifiers including names, SSN, driver's license, passport, street address, and coordinates; tokenizes patient IDs to UUIDs; truncates zip codes to 3 digits; and age-buckets birthdates into 5-year ranges. The job also detects and quarantines malformed source rows with an audit trail, and resolves Glue union struct types via resolveChoice. De-identified data is written to an Iceberg silver layer. Two-layer data quality validation: AWS Glue DQDL (8 rules, pipeline gate) plus an independent Great Expectations audit (17 checks) including PHI column absence by name and UUID tokenisation verification."
