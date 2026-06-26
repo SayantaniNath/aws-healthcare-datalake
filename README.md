@@ -1,6 +1,6 @@
 # ClinicalFlow — AWS Healthcare Data Lakehouse
 
-A portfolio-grade data engineering project demonstrating a production-style healthcare data lakehouse on AWS. Built on 64,338 synthetic patients (Synthea EHR) with full HIPAA Safe Harbor de-identification, GDPR erasure support, multi-layer data quality validation, and an Iceberg-based silver layer.
+A portfolio-grade data engineering project demonstrating a production-style healthcare data lakehouse on AWS. Built on 64,338 synthetic patients (Synthea EHR) with full HIPAA Safe Harbor de-identification, GDPR erasure support, multi-layer data quality validation, Iceberg-based silver layer, EMR Serverless batch aggregation, and statistical anomaly detection.
 
 ---
 
@@ -10,23 +10,39 @@ A portfolio-grade data engineering project demonstrating a production-style heal
 Synthea EHR (CSV, 8.2 GB)
         │
         ▼
-S3 raw/synthea/csv/          ← SSE-KMS encrypted (alias/clinicalflow-cmk)
+S3 raw/synthea/csv/              ← SSE-KMS encrypted (alias/clinicalflow-cmk)
         │
         ▼
-Glue Crawler                 ← clinicalflow-raw-crawler → clinicalflow_raw catalog
+Glue Crawler                     ← clinicalflow-raw-crawler → clinicalflow_raw catalog
         │
         ▼
-Glue ETL Job                 ← hipaa_deid_patients.py
-  ├── resolveChoice           ← fix union struct types from malformed rows
-  ├── Quarantine              ← 3 malformed rows → quarantine/patients/ with audit timestamp
-  ├── HIPAA Safe Harbor       ← drop 14 PHI columns, tokenize ID, truncate zip, age-bucket
-  └── Write                   ← silver/patients/ as Iceberg v2
+Glue ETL Job                     ← hipaa_deid_patients.py
+  ├── resolveChoice               ← fix union struct types from malformed rows
+  ├── Quarantine                  ← 3 malformed rows → quarantine/patients/
+  ├── HIPAA Safe Harbor           ← drop 14 PHI cols, tokenize ID, truncate zip, age-bucket
+  └── Write                       ← silver/patients/ as Iceberg v2
         │
         ▼
-S3 silver/patients/          ← Iceberg table, 15 clean columns, 64,335 rows
+S3 silver/patients/              ← Iceberg v2, 15 clean columns, 64,335 rows
         │
-        ├── GE validation     ← ge_validate_silver_patients.py (17 checks)
-        └── DQDL ruleset      ← clinicalflow-silver-patients-phi-audit (8 rules)
+        ├── GE validation         ← ge_validate_silver_patients.py (17 checks ✅)
+        └── DQDL ruleset          ← clinicalflow-silver-patients-phi-audit (8 rules ✅)
+
+S3 raw/synthea/csv/ (encounters + patients)
+        │
+        ▼
+EMR Serverless                   ← readmission_aggregation.py
+  ├── Window function             ← LAG() to detect 30-day readmissions per patient
+  ├── Join on original IDs        ← raw patients.csv (not silver — see note below)
+  └── GroupBy demographics        ← gender/race/ethnicity/state/birth_year_bucket
+        │
+        ▼
+S3 gold/readmission_summary/     ← Parquet, aggregated readmission rates by demographic group
+        │
+        ▼
+EMR Serverless                   ← readmission_anomaly_detection.py
+  ├── Z-score (Spark SQL)         ← flag rows where readmission_rate > 2 stddevs from mean
+  └── Write                       ← gold/readmission_anomalies/ with z_score + is_anomaly cols
 ```
 
 ---
@@ -61,11 +77,13 @@ S3 silver/patients/          ← Iceberg table, 15 clean columns, 64,335 rows
 **S3 folder structure:**
 ```
 clinicalflow-datalake-941141114246/
-├── raw/synthea/csv/          ← 16 Synthea CSV files
-├── silver/patients/          ← Iceberg de-identified patients
-├── quarantine/patients/      ← malformed source rows with audit metadata
-├── gold/                     ← Redshift-ready aggregates (pending)
-└── cloudtrail-logs/          ← CloudTrail audit logs
+├── raw/synthea/csv/               ← 16 Synthea CSV files (original IDs intact)
+├── silver/patients/               ← Iceberg v2, de-identified, tokenized IDs
+├── quarantine/patients/           ← malformed source rows with audit metadata
+├── gold/readmission_summary/      ← aggregated readmission rates by demographic group
+├── gold/readmission_anomalies/    ← same + z_score + is_anomaly flag
+├── scripts/                       ← EMR Serverless job scripts
+└── cloudtrail-logs/               ← CloudTrail audit logs
 ```
 
 ---
@@ -154,6 +172,61 @@ python3 validation/ge_validate_silver_patients.py
 
 ---
 
+## EMR Serverless — Readmission Aggregation
+
+**Job:** `emr_jobs/readmission_aggregation.py`
+**App:** `clinicalflow-readmission` (ID: `00g6nqkmpf48d309`)
+**Output:** `gold/readmission_summary/`
+
+Reads raw encounters and patients CSVs, flags 30-day readmissions per patient using a Spark window function, then aggregates readmission rates by demographic group.
+
+**Key design decision — why raw patients and not silver:**
+
+The de-identification job tokenized patient IDs (original UUID → new random UUID). `encounters.csv` still has original Synthea IDs. Joining `encounters.PATIENT == silver.patients.id` produces 0 rows because the IDs no longer match.
+
+Fix: join against `raw/patients.csv` which still has original IDs. This is safe because the output is fully aggregated — no individual patient rows survive into the gold layer.
+
+**Production note:** In a real HIPAA pipeline you would:
+1. De-identify all tables (tokenize `PATIENT` in encounters using the same mapping)
+2. Keep a secure `original_id → new_uuid` mapping table under strict IAM
+3. All downstream joins use the new UUID consistently
+
+**Window function logic:**
+```python
+w = Window.partitionBy("PATIENT").orderBy("START")
+df = df.withColumn("prev_stop", F.lag("STOP").over(w))
+       .withColumn("days_since_last", F.datediff("START", "prev_stop"))
+       .withColumn("is_readmission", F.when(days_since_last <= 30, 1).otherwise(0))
+```
+For each patient, sorted by encounter start time, check if the gap from the previous encounter end is ≤ 30 days.
+
+---
+
+## EMR Serverless — Anomaly Detection
+
+**Job:** `emr_jobs/readmission_anomaly_detection.py`
+**Output:** `gold/readmission_anomalies/`
+
+Reads `gold/readmission_summary/` and flags rows where `readmission_rate` is statistically unusual using a z-score.
+
+**Z-score (Spark SQL window function):**
+```sql
+SELECT *,
+    ROUND(
+        (readmission_rate - AVG(readmission_rate) OVER ()) /
+        NULLIF(STDDEV(readmission_rate) OVER (), 0)
+    , 3) AS z_score,
+    ABS(...) > 2.0 AS is_anomaly
+FROM readmission_summary
+```
+
+`AVG() OVER ()` and `STDDEV() OVER ()` compute across all rows (global window). Any row more than 2 standard deviations from the mean is flagged. ~95% of normally distributed values fall within 2 stddevs — beyond that is statistically rare.
+
+**Why pure Spark SQL and not sklearn IsolationForest:**
+sklearn is not pre-installed on EMR Serverless. Packaging a virtual environment adds complexity. Z-score in Spark SQL is the DE-native approach — no external libraries, runs on any Spark cluster, fully explainable. For multi-column outlier detection, IQR-based fencing with `percentile_approx` is the equivalent native method.
+
+---
+
 ## Phase 1 Step-by-Step Progress
 
 | # | Step | What was done | Status | Date |
@@ -171,9 +244,10 @@ python3 validation/ge_validate_silver_patients.py
 | 11 | Glue ETL v2 | Fixed job: added address/drivers/maiden to drop list; added resolveChoice for numeric cols; added quarantine step for malformed rows; fixed IAM (added s3:DeleteObject); removed duplicate job.commit() | ✅ | 2026-06-24 |
 | 12 | DQDL ruleset | Created `clinicalflow-silver-patients-phi-audit` ruleset on silver patients table — 8 rules. Fixed partition_0 issue (crawler added spurious partition key — deleted table, recreated via CLI with PartitionKeys:[]). 8/8 passing | ✅ | 2026-06-24 |
 | 13 | Iceberg silver | Converted silver/patients from Parquet to Iceberg v2. Resolved 3 catalog config errors (see Debugging Log). GE 17/17 re-validated on Iceberg output | ✅ | 2026-06-25 |
-| 14 | dim_patient_consent | GDPR consent table with erasure flag | ⏳ | — |
+| 14 | dim_patient_consent | GDPR consent table with erasure flag — Glue job written, not yet run | ⏳ | — |
 | 15 | Redshift gold | Column-level privileges, analytical views | ⏳ | — |
-| 16 | EMR Serverless | PySpark readmission aggregation — window functions, 30-day flag, gold/readmission_summary/ Parquet output | ✅ | 2026-06-25 |
+| 16 | EMR Serverless — readmission aggregation | PySpark window function 30-day readmission flag, join on raw patients (see debugging log), gold/readmission_summary/ Parquet | ✅ | 2026-06-26 |
+| 17 | EMR Serverless — anomaly detection | Z-score in Spark SQL on readmission_summary, gold/readmission_anomalies/ with z_score + is_anomaly cols | ✅ | 2026-06-26 |
 
 ---
 
@@ -433,6 +507,57 @@ After this, the job succeeded. Iceberg write confirmed by presence of `metadata/
 
 ---
 
+### EMR Serverless Job Errors
+
+---
+
+**Error: `ModuleNotFoundError: No module named 'sklearn'`**
+
+```
+ModuleNotFoundError: No module named 'sklearn'.
+Please refer to user guide on how to use python libraries with EMR Serverless.
+```
+
+Cause: sklearn (scikit-learn) is not pre-installed on EMR Serverless. Unlike EMR on EC2 where you can bootstrap packages, EMR Serverless requires packaging a Python virtual environment as a `.tar.gz` and shipping it via `spark.archives`.
+
+Fix: Rewrote the anomaly detection script using only PySpark and Spark SQL — no external libraries needed. Z-score via `AVG() OVER ()` and `STDDEV() OVER ()` window functions. IQR-based outlier detection via `percentile_approx()`. Both are native Spark SQL and the DE-standard approach anyway.
+
+**Lesson:** Always prefer Spark-native methods on EMR Serverless. If sklearn is genuinely needed, package a venv:
+```bash
+python3 -m venv sklearn_env && source sklearn_env/bin/activate
+pip install scikit-learn numpy pandas
+cd sklearn_env && zip -r ../sklearn_env.zip .
+aws s3 cp sklearn_env.zip s3://your-bucket/scripts/
+# In job submission add:
+# --conf spark.archives=s3://your-bucket/scripts/sklearn_env.zip#environment
+# --conf spark.emr-serverless.driverEnv.PYSPARK_PYTHON=./environment/bin/python
+# --conf spark.executorEnv.PYSPARK_PYTHON=./environment/bin/python
+```
+
+---
+
+**Error: `readmission_summary` wrote 0 rows — inner join on tokenized patient IDs**
+
+```
+Rows: 0
+Empty DataFrame
+Columns: [gender, race, ethnicity, state, birth_year_bucket, total_encounters, readmissions_30d, readmission_rate]
+```
+
+Cause: `readmission_aggregation.py` joined `encounters.PATIENT` against `silver.patients.id`. The de-identification job tokenized patient IDs — every patient in silver has a new random UUID that does not match the original Synthea IDs still present in `encounters.csv`. Inner join produced 0 matches.
+
+Debugging steps:
+1. Checked `gold/readmission_summary/` row count locally with pandas → 0 rows
+2. Traced back to the join condition in the aggregation script
+3. Confirmed silver `id` column contains new UUIDs (GE check: UUID regex passes on all rows)
+4. Confirmed `encounters.PATIENT` contains original Synthea UUIDs → mismatch confirmed
+
+Fix: Changed the aggregation script to read `raw/patients.csv` instead of `silver/patients/`. Raw CSV has original IDs that match encounters. Safe because output is fully aggregated — no individual patient rows survive into the gold layer.
+
+**Production fix:** De-identify encounters table too by tokenizing the `PATIENT` column using the same original→UUID mapping used for patients. Maintain a secure mapping table under strict IAM — never expose it outside the de-identification pipeline.
+
+---
+
 ## Local Debug Commands
 
 ```bash
@@ -473,10 +598,21 @@ aws glue get-table --database-name clinicalflow_silver --name patients
 ```
 aws-healthcare-datalake/
 ├── glue_jobs/
-│   └── hipaa_deid_patients.py         ← HIPAA de-id ETL + quarantine + Iceberg write
+│   ├── hipaa_deid_patients.py         ← HIPAA de-id ETL + quarantine + Iceberg write
+│   └── dim_patient_consent.py         ← GDPR consent table with erasure flag
+├── emr_jobs/
+│   ├── readmission_aggregation.py     ← 30-day readmission window function + demographic groupBy
+│   └── readmission_anomaly_detection.py ← z-score anomaly flagging on gold summary
 ├── validation/
 │   ├── ge_validate_silver_patients.py ← GE PHI audit (17 checks)
 │   └── reports/                       ← timestamped JSON reports per run
+├── athena/
+│   └── gold_views.sql                 ← Athena views on gold layer
+├── audit/
+│   └── verify_cloudtrail.py           ← CloudTrail log verification
+├── setup/
+│   ├── iam_setup.sh                   ← IAM roles for Glue + EMR Serverless
+│   └── s3_kms_setup.sh                ← S3 bucket + KMS CMK + CloudTrail setup
 ├── profiling/
 │   └── profile_patients.py            ← ydata-profiling for PHI discovery
 └── README.md
@@ -486,4 +622,4 @@ aws-healthcare-datalake/
 
 ## Interview Story
 
-> "Built ClinicalFlow — a healthcare data lakehouse on AWS processing 64K synthetic EHR patients. Ingests raw Synthea CSVs into S3 with SSE-KMS encryption and CloudTrail audit logging. A Glue ETL job applies HIPAA Safe Harbor de-identification: drops 14 direct identifiers including names, SSN, driver's license, passport, street address, and coordinates; tokenizes patient IDs to UUIDs; truncates zip codes to 3 digits; and age-buckets birthdates into 5-year ranges. The job also detects and quarantines malformed source rows with an audit trail, and resolves Glue union struct types via resolveChoice. De-identified data is written to an Iceberg silver layer. Two-layer data quality validation: AWS Glue DQDL (8 rules, pipeline gate) plus an independent Great Expectations audit (17 checks) including PHI column absence by name and UUID tokenisation verification."
+> "Built ClinicalFlow — a healthcare data lakehouse on AWS processing 64K synthetic EHR patients. Ingests raw Synthea CSVs into S3 with SSE-KMS encryption and CloudTrail audit logging. A Glue ETL job applies HIPAA Safe Harbor de-identification: drops 14 direct identifiers including names, SSN, driver's license, passport, street address, and coordinates; tokenizes patient IDs to UUIDs; truncates zip codes to 3 digits; and age-buckets birthdates into 5-year ranges. The job detects and quarantines malformed source rows, and resolves Glue union struct types via resolveChoice. De-identified data is written to an Iceberg v2 silver layer with two-layer validation: AWS Glue DQDL (8 rules) plus Great Expectations (17 checks) including PHI column absence and UUID tokenisation verification. An EMR Serverless PySpark job then computes 30-day readmission rates by demographic group using window functions, writing aggregated gold output. A second EMR job applies z-score anomaly detection in Spark SQL to flag demographic groups with statistically unusual readmission rates — identifying a critical pipeline limitation in the process: HIPAA tokenization breaks downstream joins across tables, requiring either de-identifying all tables consistently or maintaining a secure ID mapping layer."

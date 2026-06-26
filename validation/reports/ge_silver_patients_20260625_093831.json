@@ -1,0 +1,127 @@
+{
+  "run_timestamp": "20260625_093831",
+  "source": "s3://clinicalflow-datalake-941141114246/silver/patients/",
+  "row_count": 64335,
+  "checks_passed": 17,
+  "checks_total": 17,
+  "all_pass": true,
+  "results": [
+    {
+      "check": "column 'first' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'middle' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'last' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'ssn' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'passport' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'prefix' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'suffix' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'lat' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'lon' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'birthdate' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "column 'deathdate' absent",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "zip values <= 3 chars",
+      "success": true,
+      "detail": {
+        "element_count": 64335,
+        "missing_count": 0,
+        "missing_percent": 0.0,
+        "unexpected_count": 0,
+        "unexpected_percent": 0.0,
+        "unexpected_percent_total": 0.0,
+        "unexpected_percent_nonmissing": 0.0,
+        "partial_unexpected_list": []
+      }
+    },
+    {
+      "check": "birth_year_bucket not null",
+      "success": true,
+      "detail": {
+        "element_count": 64335,
+        "unexpected_count": 0,
+        "unexpected_percent": 0.0,
+        "unexpected_percent_total": 0.0,
+        "partial_unexpected_list": []
+      }
+    },
+    {
+      "check": "birth_year_bucket divisible by 5",
+      "success": true,
+      "detail": {}
+    },
+    {
+      "check": "id not null",
+      "success": true,
+      "detail": {
+        "element_count": 64335,
+        "unexpected_count": 0,
+        "unexpected_percent": 0.0,
+        "unexpected_percent_total": 0.0,
+        "partial_unexpected_list": []
+      }
+    },
+    {
+      "check": "id matches UUID format",
+      "success": true,
+      "detail": {
+        "element_count": 64335,
+        "missing_count": 0,
+        "missing_percent": 0.0,
+        "unexpected_count": 0,
+        "unexpected_percent": 0.0,
+        "unexpected_percent_total": 0.0,
+        "unexpected_percent_nonmissing": 0.0,
+        "partial_unexpected_list": []
+      }
+    },
+    {
+      "check": "row count > 0",
+      "success": true,
+      "detail": {
+        "observed_value": 64335
+      }
+    }
+  ]
+}
